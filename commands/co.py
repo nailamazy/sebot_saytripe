@@ -467,6 +467,12 @@ async def co_handler(msg: Message):
         parse_mode=ParseMode.HTML
     )
 
+    # Auto-delete user's message to keep chat clean
+    try:
+        await msg.delete()
+    except Exception:
+        pass  # No delete permission in this chat
+
     # Create session context FIRST — same TLS/fingerprints for init AND confirm
     session_ctx = generate_session_context(user_id)
     init_proxy = get_user_proxy(user_id)
