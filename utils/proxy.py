@@ -32,6 +32,11 @@ def save_proxies(data: dict):
 def parse_proxy_format(proxy_str: str) -> dict:
     """Parse various proxy string formats into components."""
     proxy_str = proxy_str.strip()
+    # Strip protocol prefix to prevent double prefix
+    for prefix in ("http://", "https://", "socks5://", "socks4://"):
+        if proxy_str.lower().startswith(prefix):
+            proxy_str = proxy_str[len(prefix):]
+            break
     result = {"user": None, "password": None, "host": None, "port": None, "raw": proxy_str}
 
     try:
