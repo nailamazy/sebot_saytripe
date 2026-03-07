@@ -421,6 +421,34 @@ async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, us
                 "type": "card",
             }
         },
+        {
+            "v": 2,
+            "tag": "checkout_contact_info_rendered",
+            "src": "checkout-js",
+            "pid": fp["guid"],
+            "data": {
+                "url": checkout_url,
+                "muid": fp["muid"],
+                "sid": fp["sid"],
+                "renderTimestamp": now + random.randint(2500, 4500),
+                "livemode": True,
+                "hasEmail": True,
+            }
+        },
+        {
+            "v": 2,
+            "tag": "checkout_payment_form_interacted",
+            "src": "checkout-js",
+            "pid": fp["guid"],
+            "data": {
+                "url": checkout_url,
+                "muid": fp["muid"],
+                "sid": fp["sid"],
+                "interactionTimestamp": now + random.randint(4000, 7000),
+                "livemode": True,
+                "fieldType": "cardNumber",
+            }
+        },
     ]
     
     sent = 0
