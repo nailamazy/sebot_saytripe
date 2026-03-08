@@ -475,7 +475,6 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                                     site_key=site_key,
                                     url=checkout_url,
                                     rqdata=rqdata or None,
-                                    proxy=captcha_proxy,
                                     user_agent=captcha_ua,
                                 )
                                 
