@@ -605,18 +605,25 @@ async def co_handler(msg: Message):
             live = sum(1 for r in results if r['status'] == 'LIVE')
             declined = sum(1 for r in results if r['status'] == 'DECLINED')
             three_ds = sum(1 for r in results if r['status'] == '3DS')
+            captcha_solved = sum(1 for r in results if r['status'] == 'SOLVED CAPTCHA')
             errors = sum(1 for r in results if r['status'] in ['ERROR', 'FAILED'])
+
+            progress_lines = [
+                f"<blockquote><code>「 𝗖𝗵𝗮𝗿𝗴𝗶𝗻𝗴 {price_str} 」</code></blockquote>\n\n",
+                f"<blockquote>「❃」 𝗣𝗿𝗼𝘅𝘆 : <code>{proxy_display}</code>\n",
+                f"「❃」 𝗣𝗿𝗼𝗴𝗿𝗲𝘀𝘀 : <code>{i+1}/{len(cards)}</code></blockquote>\n\n",
+                f"<blockquote>「❃」 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 : <code>{charged} 😎</code>\n",
+                f"「❃」 𝗟𝗶𝘃𝗲 : <code>{live} ✅</code>\n",
+                f"「❃」 𝗗𝗲𝗰𝗹𝗶𝗻𝗲𝗱 : <code>{declined} 🥲</code>\n",
+                f"「❃」 𝟯𝗗𝗦 : <code>{three_ds} 😡</code>\n",
+            ]
+            if captcha_solved > 0:
+                progress_lines.append(f"「❃」 𝗦𝗼𝗹𝘃𝗲𝗱 : <code>{captcha_solved} 🧩</code>\n")
+            progress_lines.append(f"「❃」 𝗘𝗿𝗿𝗼𝗿𝘀 : <code>{errors} 💀</code></blockquote>")
 
             try:
                 await processing_msg.edit_text(
-                    f"<blockquote><code>「 𝗖𝗵𝗮𝗿𝗴𝗶𝗻𝗴 {price_str} 」</code></blockquote>\n\n"
-                    f"<blockquote>「❃」 𝗣𝗿𝗼𝘅𝘆 : <code>{proxy_display}</code>\n"
-                    f"「❃」 𝗣𝗿𝗼𝗴𝗿𝗲𝘀𝘀 : <code>{i+1}/{len(cards)}</code></blockquote>\n\n"
-                    f"<blockquote>「❃」 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 : <code>{charged} 😎</code>\n"
-                    f"「❃」 𝗟𝗶𝘃𝗲 : <code>{live} ✅</code>\n"
-                    f"「❃」 𝗗𝗲𝗰𝗹𝗶𝗻𝗲𝗱 : <code>{declined} 🥲</code>\n"
-                    f"「❃」 𝟯𝗗𝗦 : <code>{three_ds} 😡</code>\n"
-                    f"「❃」 𝗘𝗿𝗿𝗼𝗿𝘀 : <code>{errors} 💀</code></blockquote>",
+                    "".join(progress_lines),
                     parse_mode=ParseMode.HTML
                 )
             except Exception:
@@ -635,6 +642,7 @@ async def co_handler(msg: Message):
     live_count = sum(1 for r in results if r['status'] == 'LIVE')
     declined_count = sum(1 for r in results if r['status'] == 'DECLINED')
     three_ds_count = sum(1 for r in results if r['status'] == '3DS')
+    captcha_count = sum(1 for r in results if r['status'] == 'SOLVED CAPTCHA')
     error_count = sum(1 for r in results if r['status'] in ['ERROR', 'FAILED', 'UNKNOWN'])
     req_name = msg.from_user.full_name or msg.from_user.username or 'Unknown'
     req_user = f"@{msg.from_user.username}" if msg.from_user.username else req_name
@@ -660,6 +668,8 @@ async def co_handler(msg: Message):
         if live_count > 0:
             summary_parts.append(f"✅ {live_count}")
         summary_parts.append(f"🥲 {declined_count}")
+        if captcha_count > 0:
+            summary_parts.append(f"🧩 {captcha_count}")
         if three_ds_count > 0:
             summary_parts.append(f"😡 {three_ds_count}")
         response += "  ".join(summary_parts)
@@ -776,6 +786,8 @@ async def co_handler(msg: Message):
         if live_count > 0:
             summary_parts.append(f"✅ {live_count}")
         summary_parts.append(f"🥲 {declined_count}")
+        if captcha_count > 0:
+            summary_parts.append(f"🧩 {captcha_count}")
         if three_ds_count > 0:
             summary_parts.append(f"😡 {three_ds_count}")
         if error_count > 0:
