@@ -50,11 +50,33 @@ def _detect_browser_info(ua: str) -> dict:
     return info
 
 
-def get_stripe_headers() -> dict:
-    """Minimal Stripe-specific headers for use with curl_cffi impersonate.
-    Browser headers (UA, sec-ch-ua, etc) are auto-set by curl_cffi."""
-    return {
+def _get_grease_brand(major: str) -> tuple:
+    """Get deterministic GREASE brand based on Chrome major version.
+    Real Chrome picks GREASE brand deterministically, not randomly."""
+    grease_options = [
+        ("Not_A Brand", "8"),
+        ("Not A(Brand", "99"),
+        ("Not)A;Brand", "99"),
+        ("Not/A)Brand", "8"),
+    ]
+    idx = int(major) % len(grease_options)
+    return grease_options[idx]
+
+
+def get_stripe_headers(user_agent: str = None) -> dict:
+    """Stripe-specific headers for use with curl_cffi impersonate.
+    When user_agent is provided, sets correct sec-ch-ua headers
+    (critical for Edge/Opera where curl_cffi defaults don't match UA)."""
+    headers = {
         "accept": "application/json",
+        "accept-language": random.choice([
+            "en-US,en;q=0.9",
+            "en-US,en;q=0.9,id;q=0.8",
+            "en-GB,en;q=0.9,en-US;q=0.8",
+            "en-US,en;q=0.9,nl;q=0.8",
+            "en-US,en;q=0.9,de;q=0.8",
+            "en-US,en;q=0.9,fr;q=0.8",
+        ]),
         "content-type": "application/x-www-form-urlencoded",
         "origin": "https://checkout.stripe.com",
         "referer": "https://checkout.stripe.com/",
@@ -62,6 +84,22 @@ def get_stripe_headers() -> dict:
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-site",
     }
+    if user_agent:
+        headers["user-agent"] = user_agent
+        browser = _detect_browser_info(user_agent)
+        v = browser["version"]
+        platform = browser["platform"]
+        if browser["browser"] in ("Chrome", "Edge", "Opera"):
+            g_brand, g_ver = _get_grease_brand(v)
+            if browser["browser"] == "Edge":
+                headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Microsoft Edge";v="{v}"'
+            elif browser["browser"] == "Opera":
+                headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Opera";v="{v}"'
+            else:
+                headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Google Chrome";v="{v}"'
+            headers["sec-ch-ua-mobile"] = "?0"
+            headers["sec-ch-ua-platform"] = f'"{platform}"'
+    return headers
 
 
 def get_headers(stripe_js: bool = False) -> dict:
@@ -92,22 +130,15 @@ def get_headers(stripe_js: bool = False) -> dict:
         headers["sec-fetch-mode"] = "cors"
         headers["sec-fetch-site"] = "same-site"
 
-        # Dynamic sec-ch-ua based on actual browser
+        # Dynamic sec-ch-ua based on actual browser (deterministic GREASE brand)
         if browser["browser"] in ("Chrome", "Edge", "Opera"):
-            not_a_brands = [
-                '"Not(A:Brand";v="24"',
-                '"Not_A Brand";v="8"',
-                '"Not/A)Brand";v="8"',
-                '"Not A(Brand";v="99"',
-                '"Not)A;Brand";v="99"',
-            ]
-            not_a = random.choice(not_a_brands)
+            g_brand, g_ver = _get_grease_brand(v)
             if browser["browser"] == "Edge":
-                headers["sec-ch-ua"] = f'"Chromium";v="{v}", {not_a}, "Microsoft Edge";v="{v}"'
+                headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Microsoft Edge";v="{v}"'
             elif browser["browser"] == "Opera":
-                headers["sec-ch-ua"] = f'"Chromium";v="{v}", {not_a}, "Opera";v="{v}"'
+                headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Opera";v="{v}"'
             else:
-                headers["sec-ch-ua"] = f'"Chromium";v="{v}", {not_a}, "Google Chrome";v="{v}"'
+                headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Google Chrome";v="{v}"'
             headers["sec-ch-ua-mobile"] = "?0"
             headers["sec-ch-ua-platform"] = f'"{platform}"'
         # Firefox/Safari don't send sec-ch-ua
@@ -115,86 +146,173 @@ def get_headers(stripe_js: bool = False) -> dict:
     return headers
 
 import hashlib
+import json as _json
 import aiohttp
+import time as _time
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  X-Stripe-Telemetry tracking
+#  Real Stripe.js sends this on every request after the first
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_last_request_metrics = {}
+
+
+def record_stripe_request(request_id: str, duration_ms: int):
+    """Record metrics from a Stripe API response for telemetry header.
+    
+    Call this after every Stripe API request with:
+    - request_id: from response header 'Request-Id' (e.g. 'req_xxx')
+    - duration_ms: how long the request took in ms
+    """
+    global _last_request_metrics
+    _last_request_metrics = {
+        "request_id": request_id,
+        "request_duration_ms": duration_ms,
+    }
+
+
+def get_stripe_telemetry_header() -> str | None:
+    """Get X-Stripe-Telemetry header value if we have previous request metrics.
+    
+    Returns None on first request (real Stripe.js doesn't send it on first request).
+    """
+    if not _last_request_metrics:
+        return None
+    return _json.dumps({"last_request_metrics": _last_request_metrics})
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Real Stripe.js hash scraping from CDN
+#  Auto-refreshes every 3 hours (TTL)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_STRIPE_HASH_TTL = 3 * 60 * 60  # 3 jam dalam detik
+
 _cached_stripe_hashes = {
     "core": None,     # stripe.js main bundle hash
     "v3": None,       # stripe-js-v3 module hash
-    "fetched": False, # whether we've attempted fetch
+    "fetched_at": 0,  # timestamp terakhir fetch (epoch seconds)
 }
+_stripe_hash_lock = None  # asyncio.Lock, lazy init
 
 
-async def fetch_stripe_js_hashes():
+def _is_hash_stale() -> bool:
+    """Check apakah hash sudah expired (lebih dari 3 jam)."""
+    if not _cached_stripe_hashes["core"]:
+        return True  # Belum pernah fetch
+    elapsed = _time.time() - _cached_stripe_hashes["fetched_at"]
+    return elapsed >= _STRIPE_HASH_TTL
+
+
+async def _get_hash_lock():
+    """Lazy init asyncio.Lock (harus di dalam event loop)."""
+    global _stripe_hash_lock
+    if _stripe_hash_lock is None:
+        _stripe_hash_lock = asyncio.Lock()
+    return _stripe_hash_lock
+
+
+async def fetch_stripe_js_hashes(force: bool = False):
     """Fetch real Stripe.js from CDN and extract build hashes.
     
-    Should be called once at bot startup. Extracts fingerprint hashes
-    from the webpack bundle's 'fingerprinted/js/' asset paths, which
-    are the same hashes Stripe uses to identify legitimate JS clients.
+    Auto-refreshes setiap 3 jam. Bisa dipanggil berkali-kali — 
+    hanya fetch ulang jika TTL expired atau force=True.
+    
+    Extracts fingerprint hashes from the webpack bundle's 
+    'fingerprinted/js/' asset paths, which are the same hashes 
+    Stripe uses to identify legitimate JS clients.
     """
     global _cached_stripe_hashes
     
-    if _cached_stripe_hashes["fetched"]:
+    # Skip jika hash masih fresh (belum expired)
+    if not force and not _is_hash_stale():
         return
     
-    _cached_stripe_hashes["fetched"] = True
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://js.stripe.com/v3/",
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    "Accept": "*/*",
-                },
-                timeout=aiohttp.ClientTimeout(total=15),
-                ssl=False,
-            ) as resp:
-                if resp.status != 200:
-                    print(f"[DEBUG] Stripe.js fetch failed: HTTP {resp.status}")
-                    return
-                
-                content = await resp.text()
-                
-                # Extract fingerprint hashes from the webpack bundle
-                # Real Stripe.js contains paths like: fingerprinted/js/MODULE-HASH.js
-                js_hashes = re.findall(
-                    r'fingerprinted/js/[a-zA-Z0-9_-]+-([a-f0-9]{20,40})\.js',
-                    content
-                )
-                
-                if js_hashes:
-                    # Use first two distinct hashes for core and v3
-                    unique_hashes = list(dict.fromkeys(js_hashes))
-                    _cached_stripe_hashes["core"] = unique_hashes[0][:10]
-                    if len(unique_hashes) > 1:
-                        _cached_stripe_hashes["v3"] = unique_hashes[1][:10]
+    # Prevent concurrent fetches
+    lock = await _get_hash_lock()
+    async with lock:
+        # Double-check setelah acquire lock
+        if not force and not _is_hash_stale():
+            return
+        
+        old_core = _cached_stripe_hashes.get("core")
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://js.stripe.com/v3/",
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                        "Accept": "*/*",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    ssl=False,
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"[DEBUG] Stripe.js fetch failed: HTTP {resp.status}")
+                        # Jangan reset fetched_at agar retry lagi nanti
+                        return
+                    
+                    content = await resp.text()
+                    
+                    # Extract fingerprint hashes from the webpack bundle
+                    # Real Stripe.js contains paths like: fingerprinted/js/MODULE-HASH.js
+                    js_hashes = re.findall(
+                        r'fingerprinted/js/[a-zA-Z0-9_-]+-([a-f0-9]{20,40})\.js',
+                        content
+                    )
+                    
+                    if js_hashes:
+                        # Use first two distinct hashes for core and v3
+                        unique_hashes = list(dict.fromkeys(js_hashes))
+                        _cached_stripe_hashes["core"] = unique_hashes[0][:10]
+                        if len(unique_hashes) > 1:
+                            _cached_stripe_hashes["v3"] = unique_hashes[1][:10]
+                        else:
+                            _cached_stripe_hashes["v3"] = unique_hashes[0][:10]
+                        _cached_stripe_hashes["fetched_at"] = _time.time()
+                        
+                        changed = old_core != _cached_stripe_hashes["core"]
+                        status = "🔄 UPDATED" if (old_core and changed) else "✅ Fetched"
+                        print(f"[DEBUG] {status} Stripe.js hashes: "
+                              f"core={_cached_stripe_hashes['core']}, "
+                              f"v3={_cached_stripe_hashes['v3']} "
+                              f"(from {len(unique_hashes)} unique hashes, "
+                              f"TTL={_STRIPE_HASH_TTL//3600}h)")
                     else:
-                        _cached_stripe_hashes["v3"] = unique_hashes[0][:10]
-                    
-                    print(f"[DEBUG] ✅ Stripe.js real hashes scraped: "
-                          f"core={_cached_stripe_hashes['core']}, "
-                          f"v3={_cached_stripe_hashes['v3']} "
-                          f"(from {len(unique_hashes)} unique hashes)")
-                else:
-                    # Fallback: derive hash from content itself
-                    content_hash = hashlib.sha256(content.encode()).hexdigest()
-                    _cached_stripe_hashes["core"] = content_hash[:10]
-                    _cached_stripe_hashes["v3"] = content_hash[10:20]
-                    print(f"[DEBUG] ⚠️ No fingerprint paths found, using content hash: "
-                          f"core={_cached_stripe_hashes['core']}, "
-                          f"v3={_cached_stripe_hashes['v3']}")
-                    
-    except Exception as e:
-        print(f"[DEBUG] ❌ Stripe.js hash fetch error: {str(e)[:80]}")
+                        # Fallback: derive hash from content itself
+                        content_hash = hashlib.sha256(content.encode()).hexdigest()
+                        _cached_stripe_hashes["core"] = content_hash[:10]
+                        _cached_stripe_hashes["v3"] = content_hash[10:20]
+                        _cached_stripe_hashes["fetched_at"] = _time.time()
+                        print(f"[DEBUG] ⚠️ No fingerprint paths found, using content hash: "
+                              f"core={_cached_stripe_hashes['core']}, "
+                              f"v3={_cached_stripe_hashes['v3']}")
+                        
+        except Exception as e:
+            print(f"[DEBUG] ❌ Stripe.js hash fetch error: {str(e)[:80]}")
+            # Jika sudah punya hash lama, tetap pakai — jangan kosongkan
+            # Hanya set fetched_at mundur sedikit agar retry lebih cepat (30 menit)
+            if _cached_stripe_hashes["core"]:
+                _cached_stripe_hashes["fetched_at"] = _time.time() - _STRIPE_HASH_TTL + 1800
+                print(f"[DEBUG] ⚠️ Keeping old hashes, retry in ~30min")
 
 
 def get_random_stripe_js_agent() -> str:
-    """Get Stripe.js payment_user_agent using real CDN hashes when available."""
+    """Get Stripe.js payment_user_agent using real CDN hashes when available.
+    
+    Jika hash sudah stale, akan trigger background refresh pada call berikutnya.
+    """
     core = _cached_stripe_hashes.get("core")
     v3 = _cached_stripe_hashes.get("v3")
+    
+    # Schedule background refresh jika stale (non-blocking)
+    if _is_hash_stale():
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(fetch_stripe_js_hashes())
+            print(f"[DEBUG] 🔄 Stripe.js hash refresh scheduled (TTL expired)")
+        except RuntimeError:
+            pass  # No event loop — will be refreshed on next async call
     
     if not core or not v3:
         # Last resort fallback — should rarely happen if fetch_stripe_js_hashes() was called
@@ -236,6 +354,153 @@ def generate_stripe_fingerprints(user_id: int = None) -> dict:
 def generate_eid() -> str:
     """Generate a valid UUID v4 for the eid parameter."""
     return str(uuid.uuid4())
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Canvas/WebGL Device Fingerprint
+#  Simulates what Stripe Radar collects from real browsers
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Real GPU renderers seen on common hardware
+_WEBGL_RENDERERS = [
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 2060 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (AMD)", "renderer": "ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (AMD)", "renderer": "ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (AMD)", "renderer": "ANGLE (AMD, AMD Radeon RX 7800 XT Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (Intel)", "renderer": "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (Intel)", "renderer": "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (Intel)", "renderer": "ANGLE (Intel, Intel(R) UHD Graphics 770 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    # macOS renderers
+    {"vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple, Apple M1, OpenGL 4.1)"},
+    {"vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple, Apple M2, OpenGL 4.1)"},
+    {"vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple, Apple M3, OpenGL 4.1)"},
+    {"vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple, Apple M1 Pro, OpenGL 4.1)"},
+    # Linux renderers (Mesa/OpenGL 4.5 — D3D11 is Windows-only)
+    {"vendor": "Google Inc. (Intel)", "renderer": "ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.5)"},
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650/PCIe/SSE2, OpenGL 4.5)"},
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060/PCIe/SSE2, OpenGL 4.5)"},
+    {"vendor": "Google Inc. (AMD)", "renderer": "ANGLE (AMD, AMD Radeon RX 580, OpenGL 4.5)"},
+]
+
+_SCREEN_RESOLUTIONS = [
+    {"w": 1920, "h": 1080, "avail_w": 1920, "avail_h": 1040, "dpr": 1},
+    {"w": 2560, "h": 1440, "avail_w": 2560, "avail_h": 1400, "dpr": 1},
+    {"w": 1920, "h": 1080, "avail_w": 1920, "avail_h": 1032, "dpr": 1.25},
+    {"w": 1536, "h": 864, "avail_w": 1536, "avail_h": 824, "dpr": 1.25},
+    {"w": 3840, "h": 2160, "avail_w": 3840, "avail_h": 2120, "dpr": 1.5},
+    {"w": 1440, "h": 900, "avail_w": 1440, "avail_h": 875, "dpr": 2},   # MacBook
+    {"w": 2560, "h": 1600, "avail_w": 2560, "avail_h": 1575, "dpr": 2},  # MacBook Pro
+    {"w": 1680, "h": 1050, "avail_w": 1680, "avail_h": 1025, "dpr": 2},  # iMac
+]
+
+_TIMEZONES = [
+    # Eastern (UTC-5)
+    {"offset": -300, "tz": "America/New_York"},
+    {"offset": -300, "tz": "America/Detroit"},
+    {"offset": -300, "tz": "America/Indiana/Indianapolis"},
+    # Central (UTC-6)
+    {"offset": -360, "tz": "America/Chicago"},
+    {"offset": -360, "tz": "America/Menominee"},
+    # Mountain (UTC-7)
+    {"offset": -420, "tz": "America/Denver"},
+    {"offset": -420, "tz": "America/Boise"},
+    {"offset": -420, "tz": "America/Phoenix"},       # Arizona (no DST)
+    # Pacific (UTC-8)
+    {"offset": -480, "tz": "America/Los_Angeles"},
+    {"offset": -480, "tz": "America/Juneau"},
+    # Alaska (UTC-9)
+    {"offset": -540, "tz": "America/Anchorage"},
+    {"offset": -540, "tz": "America/Nome"},
+    # Hawaii (UTC-10)
+    {"offset": -600, "tz": "Pacific/Honolulu"},
+    # US Territories
+    {"offset": -240, "tz": "America/Puerto_Rico"},    # AST (UTC-4)
+    {"offset": -240, "tz": "America/Virgin"},         # US Virgin Islands
+    {"offset": 600, "tz": "Pacific/Guam"},            # Guam (UTC+10)
+]
+
+# Persistent device profile per user_id
+_device_profiles = {}
+
+
+def generate_device_fingerprint(user_agent: str, user_id: int = None) -> dict:
+    """Generate a consistent device fingerprint for Canvas/WebGL/screen data.
+    
+    Returns a profile that stays consistent per user_id (like a real machine).
+    Includes: canvas hash, WebGL renderer, screen info, timezone, CPU cores, RAM.
+    """
+    # Return cached profile for same user
+    if user_id and user_id in _device_profiles:
+        return _device_profiles[user_id]
+    
+    # Pick GPU renderer based on UA platform (must be consistent)
+    is_mac = "Macintosh" in user_agent or "Mac OS X" in user_agent
+    is_linux = "Linux" in user_agent and "Android" not in user_agent
+    if is_mac:
+        gpu_pool = [g for g in _WEBGL_RENDERERS if "Apple" in g["renderer"] or "Apple" in g["vendor"]]
+        screen_pool = [s for s in _SCREEN_RESOLUTIONS if s["dpr"] == 2]
+    elif is_linux:
+        # Linux uses Mesa/OpenGL — never D3D11
+        gpu_pool = [g for g in _WEBGL_RENDERERS if "OpenGL 4.5" in g["renderer"]]
+        screen_pool = [s for s in _SCREEN_RESOLUTIONS if s["dpr"] <= 1]
+    else:
+        # Windows — D3D11 renderers only
+        gpu_pool = [g for g in _WEBGL_RENDERERS if "Direct3D11" in g["renderer"]]
+        screen_pool = [s for s in _SCREEN_RESOLUTIONS if s["dpr"] <= 1.5]
+    
+    gpu = random.choice(gpu_pool) if gpu_pool else random.choice(_WEBGL_RENDERERS)
+    screen = random.choice(screen_pool) if screen_pool else random.choice(_SCREEN_RESOLUTIONS)
+    tz = random.choice(_TIMEZONES)
+    
+    # Generate deterministic-looking canvas hash (32 hex chars)
+    seed_str = f"{gpu['renderer']}-{screen['w']}x{screen['h']}-{tz['offset']}"
+    canvas_hash = hashlib.sha256(seed_str.encode()).hexdigest()[:32]
+    
+    # WebGL hash derived from renderer
+    webgl_hash = hashlib.md5(gpu["renderer"].encode()).hexdigest()[:16]
+    
+    # Platform string must match UA
+    if is_mac:
+        plat = "MacIntel"
+    elif is_linux:
+        plat = "Linux x86_64"
+    else:
+        plat = "Win32"
+    
+    profile = {
+        "canvas_hash": canvas_hash,
+        "webgl_hash": webgl_hash,
+        "webgl_vendor": gpu["vendor"],
+        "webgl_renderer": gpu["renderer"],
+        "screen_width": screen["w"],
+        "screen_height": screen["h"],
+        "avail_width": screen["avail_w"],
+        "avail_height": screen["avail_h"],
+        "device_pixel_ratio": screen["dpr"],
+        "color_depth": 30 if is_mac else 24,
+        "timezone_offset": tz["offset"],
+        "timezone": tz["tz"],
+        "cpu_cores": random.choice([4, 6, 8, 10, 12, 16]),
+        "device_memory": random.choice([4, 8, 16, 32]),
+        "max_touch_points": 0,
+        "languages": ["en-US", "en"],
+        "platform": plat,
+        "do_not_track": random.choice([None, "1"]),
+        # Browser environment fields for beacons
+        "connection_type": random.choice(["4g", "4g", "4g", "wifi"]),
+        "cookie_enabled": True,
+        "java_enabled": False,
+        "webdriver": False,
+    }
+    
+    if user_id:
+        _device_profiles[user_id] = profile
+    
+    return profile
 
 
 def get_stripe_cookies(fp: dict, real_cookies: dict = None) -> str:
@@ -357,10 +622,12 @@ async def warm_checkout_session(checkout_url: str, tls_profile: str, user_agent:
     return result
 
 
-async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, user_agent: str, cookies_str: str, proxy: str = None) -> bool:
+async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, user_agent: str, cookies_str: str, proxy: str = None, device_fp: dict = None) -> bool:
     """Send multiple telemetry beacons to m.stripe.com/6 like real Stripe.js.
     
     Real Stripe.js sends 5+ beacons throughout page lifecycle.
+    Args:
+        device_fp: Pre-generated device fingerprint for session consistency.
     """
     import json
     import time
@@ -376,9 +643,26 @@ async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, us
         "cookie": cookies_str,
     }
     
+    # Add sec-ch-ua for Chrome-based browsers (must match UA)
+    browser = _detect_browser_info(user_agent)
+    if browser["browser"] in ("Chrome", "Edge", "Opera"):
+        v = browser["version"]
+        g_brand, g_ver = _get_grease_brand(v)
+        if browser["browser"] == "Edge":
+            beacon_headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Microsoft Edge";v="{v}"'
+        elif browser["browser"] == "Opera":
+            beacon_headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Opera";v="{v}"'
+        else:
+            beacon_headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Google Chrome";v="{v}"'
+        beacon_headers["sec-ch-ua-mobile"] = "?0"
+        beacon_headers["sec-ch-ua-platform"] = f'"{browser["platform"]}"'
+    
     now = int(time.time() * 1000)
     
-    # Multiple beacons matching real Stripe.js lifecycle
+    # Use provided device_fp for session consistency, or generate new one
+    if device_fp is None:
+        device_fp = generate_device_fingerprint(user_agent)
+    
     beacons = [
         {
             "v": 2,
@@ -392,6 +676,19 @@ async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, us
                 "pageloadTimestamp": now,
                 "livemode": True,
                 "userAgent": user_agent,
+                "screenWidth": device_fp["screen_width"],
+                "screenHeight": device_fp["screen_height"],
+                "devicePixelRatio": device_fp["device_pixel_ratio"],
+                "colorDepth": device_fp["color_depth"],
+                "timezoneOffset": device_fp["timezone_offset"],
+                "platform": device_fp["platform"],
+                "languages": device_fp["languages"],
+                "hardwareConcurrency": device_fp["cpu_cores"],
+                "deviceMemory": device_fp["device_memory"],
+                "cookieEnabled": device_fp.get("cookie_enabled", True),
+                "javaEnabled": device_fp.get("java_enabled", False),
+                "webdriver": device_fp.get("webdriver", False),
+                "connectionType": device_fp.get("connection_type", "4g"),
             }
         },
         {
@@ -447,6 +744,41 @@ async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, us
                 "interactionTimestamp": now + random.randint(4000, 7000),
                 "livemode": True,
                 "fieldType": "cardNumber",
+            }
+        },
+        # Device fingerprint beacon — Canvas/WebGL data for Stripe Radar
+        {
+            "v": 2,
+            "tag": "device_data",
+            "src": "checkout-js",
+            "pid": fp["guid"],
+            "data": {
+                "url": checkout_url,
+                "muid": fp["muid"],
+                "sid": fp["sid"],
+                "canvasHash": device_fp["canvas_hash"],
+                "webglHash": device_fp["webgl_hash"],
+                "webglVendor": device_fp["webgl_vendor"],
+                "webglRenderer": device_fp["webgl_renderer"],
+                "screenWidth": device_fp["screen_width"],
+                "screenHeight": device_fp["screen_height"],
+                "availWidth": device_fp["avail_width"],
+                "availHeight": device_fp["avail_height"],
+                "devicePixelRatio": device_fp["device_pixel_ratio"],
+                "colorDepth": device_fp["color_depth"],
+                "timezoneOffset": device_fp["timezone_offset"],
+                "timezone": device_fp["timezone"],
+                "hardwareConcurrency": device_fp["cpu_cores"],
+                "deviceMemory": device_fp["device_memory"],
+                "maxTouchPoints": device_fp["max_touch_points"],
+                "platform": device_fp["platform"],
+                "doNotTrack": device_fp["do_not_track"],
+                "cookieEnabled": device_fp.get("cookie_enabled", True),
+                "javaEnabled": device_fp.get("java_enabled", False),
+                "webdriver": device_fp.get("webdriver", False),
+                "connectionType": device_fp.get("connection_type", "4g"),
+                "livemode": True,
+                "timestamp": now + random.randint(1000, 2000),
             }
         },
     ]
@@ -522,6 +854,9 @@ def generate_session_context(user_id: int = None) -> dict:
     # Payment user agent stays same for session
     payment_user_agent = get_random_stripe_js_agent()
 
+    # Device fingerprint ONCE per session (GPU, screen, timezone stay consistent)
+    device_fp = generate_device_fingerprint(user_agent, user_id)
+
     # Randomize pasted_fields (some users type, some paste)
     pasted_fields = random.choice(["number", "number|cvc", "number|cvc|exp", ""])
 
@@ -534,6 +869,8 @@ def generate_session_context(user_id: int = None) -> dict:
         "fingerprints": fp,
         "cookies": cookies,
         "payment_user_agent": payment_user_agent,
+        "device_fp": device_fp,
         "pasted_fields": pasted_fields,
         "time_on_page_base": time_on_page_base,
+        "allow_redisplay": "unspecified",  # Modern Stripe.js always sends this
     }
