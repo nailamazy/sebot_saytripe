@@ -336,12 +336,12 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                 cust = init_data.get("customer") or {}
                 addr = cust.get("address") or {}
 
-                # Detect country: customer address → merchant country → fallback US
+                # Detect country: customer address → merchant country → fallback MO (Macau)
                 detected_country = (
                     addr.get("country")
                     or checkout_data.get("country")
                     or init_data.get("account_settings", {}).get("country")
-                    or "US"
+                    or "MO"
                 )
 
                 # Use customer data if available, otherwise random billing matched to country
