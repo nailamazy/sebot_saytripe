@@ -336,22 +336,32 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                 cust = init_data.get("customer") or {}
                 addr = cust.get("address") or {}
 
-                # Use customer data if available, otherwise random billing
+                # Detect country: customer address → merchant country → fallback US
+                detected_country = (
+                    addr.get("country")
+                    or checkout_data.get("country")
+                    or init_data.get("account_settings", {}).get("country")
+                    or "US"
+                )
+
+                # Use customer data if available, otherwise random billing matched to country
                 if cust.get("name") or addr.get("line1"):
                     name = cust.get("name") or "John Smith"
-                    country = addr.get("country") or "US"
+                    country = addr.get("country") or detected_country
                     line1 = addr.get("line1") or "742 Evergreen Terrace"
                     city = addr.get("city") or "Springfield"
                     state = addr.get("state") or "IL"
                     zip_code = addr.get("postal_code") or "62704"
                 else:
-                    billing = get_random_billing()
+                    billing = get_random_billing(detected_country)
                     name = billing["name"]
                     country = billing["country"]
                     line1 = billing["line1"]
                     city = billing["city"]
                     state = billing["state"]
                     zip_code = billing["zip"]
+                
+                print(f"[DEBUG] Billing: country={country}, name={name}, city={city}")
 
                 if attempt > 0:
                     print(f"[DEBUG] Retry attempt {attempt}...")
