@@ -345,21 +345,23 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                 )
 
                 # Use customer data if available, otherwise random billing matched to country
+                # Always get a country-matched fallback for missing fields
+                fallback = get_random_billing(detected_country)
+                
                 if cust.get("name") or addr.get("line1"):
-                    name = cust.get("name") or "John Smith"
+                    name = cust.get("name") or fallback["name"]
                     country = addr.get("country") or detected_country
-                    line1 = addr.get("line1") or "742 Evergreen Terrace"
-                    city = addr.get("city") or "Springfield"
-                    state = addr.get("state") or "IL"
-                    zip_code = addr.get("postal_code") or "62704"
+                    line1 = addr.get("line1") or fallback["line1"]
+                    city = addr.get("city") or fallback["city"]
+                    state = addr.get("state") or fallback["state"]
+                    zip_code = addr.get("postal_code") or fallback["zip"]
                 else:
-                    billing = get_random_billing(detected_country)
-                    name = billing["name"]
-                    country = billing["country"]
-                    line1 = billing["line1"]
-                    city = billing["city"]
-                    state = billing["state"]
-                    zip_code = billing["zip"]
+                    name = fallback["name"]
+                    country = fallback["country"]
+                    line1 = fallback["line1"]
+                    city = fallback["city"]
+                    state = fallback["state"]
+                    zip_code = fallback["zip"]
                 
                 print(f"[DEBUG] Billing: country={country}, name={name}, city={city}")
 
